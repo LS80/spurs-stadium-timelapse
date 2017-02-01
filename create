@@ -1,0 +1,177 @@
+#!/usr/bin/env python3.6
+
+import os
+import sys
+import re
+from time import sleep
+from datetime import date, datetime, time, timedelta
+import subprocess
+import glob
+import argparse
+import shutil
+import tempfile
+from urllib.parse import urljoin
+import logging
+from functools import partial
+
+import requests
+from PIL import Image
+
+
+HEADERS = {
+    'Authorization': 'Basic dGhfc3RhZGl1bTp5Vm13elIzZ3Z3V0w=',
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_11_6) '
+                  'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/55.0.2883.95 Safari/537.36'
+}
+JSON_URL_ROOT = 'https://www.siteeyearchive2.co.uk/api/1.0/images/project/319/'
+
+CAMERAS = [535, 533, 534, 526, 555]
+RE_FILE_NUMBER = re.compile(r'(\d{8})\.jpg$')
+
+print_now = partial(print, flush=True)
+
+
+def time_of_day(value):
+    return datetime.strptime(value, '%H:%M').time()
+
+
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('-c', '--camera', type=int, default=2, choices=range(1, 6),
+                    help="camera number")
+parser.add_argument('-d', '--days', type=int, default=0,
+                    help="number of previous days to include")
+parser.add_argument('-r', '--framerate', default='2',
+                    help="framerate for video in fps (e.g. 5, 1/5)")
+parser.add_argument('-a', '--audio-file', help="audio file to mux with video")
+parser.add_argument('--audio-start', type=int, default=0, help="start time of audio in seconds")
+parser.add_argument('--crop', type=int, nargs=2, metavar="PIXEL",
+                    help="pixel numbers defining the top left corner of the image crop "
+                         "rectangle (left top)")
+parser.add_argument('--start-time', metavar="HH:MM", type=time_of_day, default="9:00",
+                    help="start time of day for included images")
+parser.add_argument('--end-time', metavar="HH:MM", type=time_of_day, default="19:30",
+                    help="end time of day for included images")
+parser.add_argument('--sleep', type=int, default=5,
+                    help="number of seconds to sleep between image requests")
+parser.add_argument('--debug', action='store_true', help="enable debug logging")
+
+parser.add_argument('output', nargs='?', help="output video file name")
+
+args = parser.parse_args()
+
+logging.basicConfig(format='%(levelname)s: %(message)s',
+                    level=logging.DEBUG if args.debug else logging.INFO)
+
+past_date = date.today() - timedelta(days=args.days)
+datetime_start = datetime(year=past_date.year, month=past_date.month, day=past_date.day)
+
+camera_id = CAMERAS[args.camera - 1]
+start, end = (dt.strftime('%y%m%d') for dt in [past_date, datetime.today()])
+url_images_json = urljoin(JSON_URL_ROOT, f'camera/{camera_id}/start/{start}/end/{end}')
+images = requests.get(url_images_json, headers=HEADERS).json()
+
+files = []
+with requests.Session() as session:
+    for frame, image in enumerate(images, start=1):
+        date_taken = datetime.strptime(image['dateTaken'], '%Y-%m-%dT%H:%M:%S')
+
+        if date_taken < datetime_start or not args.start_time < date_taken.time() < args.end_time:
+            continue
+
+        print_now(date_taken)
+        url = image['url']
+        file_number = int(RE_FILE_NUMBER.search(url).group(1))
+
+        timestamp = date_taken.timestamp()
+        filename = f'cam{args.camera:1d}_{timestamp:.0f}_{file_number:08d}.jpg'
+
+        if not os.path.isfile(filename):
+            response = session.get(url, stream=True)
+            print_now(f'Downloading {url}... ', end='')
+            try:
+                with open(filename, 'wb') as f:
+                    for chunk in response:
+                        f.write(chunk)
+            except:
+                os.remove(filename)
+            finally:
+                print_now('done')
+            sleep(args.sleep)
+
+        files.append(filename)
+
+if not files:
+    print_now('No images within the requested times')
+    sys.exit(1)
+
+output_height, output_width = (1080, 1620) if args.crop else (2160, 3240)
+
+filters = []
+
+if not args.crop:
+    filters.append(f'scale= {output_width}:{output_height}')
+
+if sys.platform.startswith('linux'):
+    fontdir, fontname = '/usr/share/fonts/', 'LiberationSans-Bold'
+elif sys.platform == 'darwin':
+    fontdir, fontname = '/Library/Fonts/', 'LiberationSans-Bold'
+elif sys.platform == 'win32':
+    fontdir, fontname = os.path.join(os.environ['WINDIR'], 'Fonts'), 'ArialBd'
+
+fonts = glob.glob(os.path.join(fontdir, f'**/{fontname}.ttf'), recursive=True)
+if fonts:
+    fontfile, = fonts
+    fontsize = int(output_height/40)
+    border = int(output_height/144)
+    position = int(output_height/72)
+    filters.append(f"drawtext= text='%{{metadata\:datetimeoriginal}}': "
+                   f'fontsize={fontsize}: fontcolor=white: fontfile={fontfile}: '
+                   f'box=1: boxcolor=black@0.5: boxborderw={border}: x={position}: y={position}')
+else:
+    logging.warning(f'{fontname} font not found, output timestamp will be disabled')
+
+
+filtergraph = ', '.join(filters)
+
+timestamp = datetime_start.timestamp()
+output_name = args.output or f'cam{args.camera:1d}_{timestamp:.0f}.mp4'
+
+with tempfile.TemporaryDirectory() as temp_dir:
+    input_glob = os.path.join(temp_dir, f'cam{args.camera:1d}*.jpg')
+
+    ffmpeg_args = ['ffmpeg', '-y', '-framerate', args.framerate, '-pattern_type', 'glob',
+                   '-i', input_glob, '-codec:v', 'libx264', '-preset', 'slow', '-crf', '18',
+                   '-pix_fmt', 'yuv420p', '-bf', '2', '-flags', '+cgop',
+                   '-filter:v', filtergraph, '-movflags', 'faststart']
+
+    if args.audio_file:
+        ffmpeg_args += ['-ss', args.audio_start, '-i', args.audio_file, '-shortest',
+                        '-codec:a', 'copy']
+
+    ffmpeg_args += [output_name]
+
+    if args.crop:
+        left, top = args.crop
+        for f in files:
+            print(f'Cropping {f}... ', end='', flush=True)
+            temp_name = os.path.join(temp_dir, f)
+            image = Image.open(f)
+            input_width, input_height = image.size
+            exif = image.info['exif']
+            crop_points = (
+                left, top, min(left + output_width, input_width),
+                min(top + output_height, input_height)
+            )
+            cropped_image = image.crop(crop_points)
+            cropped_image.save(
+                temp_name, format='JPEG', subsampling=0, quality=100, exif=exif
+            )
+            print('done')
+    else:
+        for f in files:
+            shutil.copy(f, temp_dir)
+
+    logging.debug(' '.join(ffmpeg_args))
+    logging.debug(subprocess.check_output(ffmpeg_args, stderr=subprocess.STDOUT))
+
+print_now(f'Created {output_name}')
