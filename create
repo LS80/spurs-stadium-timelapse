@@ -62,13 +62,21 @@ args = parser.parse_args()
 logging.basicConfig(format='%(levelname)s: %(message)s',
                     level=logging.DEBUG if args.debug else logging.INFO)
 
+def no_images():
+    print_now('No images within the requested times')
+    sys.exit(1)
+
 past_date = date.today() - timedelta(days=args.days)
 datetime_start = datetime(year=past_date.year, month=past_date.month, day=past_date.day)
 
 camera_id = CAMERAS[args.camera - 1]
 start, end = (dt.strftime('%y%m%d') for dt in [past_date, datetime.today()])
 url_images_json = urljoin(JSON_URL_ROOT, f'camera/{camera_id}/start/{start}/end/{end}')
-images = requests.get(url_images_json, headers=HEADERS).json()
+response = requests.get(url_images_json, headers=HEADERS)
+if response:
+    images = response.json()
+else:
+    no_images()
 
 files = []
 with requests.Session() as session:
@@ -101,8 +109,7 @@ with requests.Session() as session:
         files.append(filename)
 
 if not files:
-    print_now('No images within the requested times')
-    sys.exit(1)
+    no_images()
 
 output_height, output_width = (1080, 1620) if args.crop else (2160, 3240)
 
